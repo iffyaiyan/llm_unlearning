@@ -1,0 +1,199 @@
+import torch
+from torch.utils.data import DataLoader, Dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer
+import torch.nn.functional as F
+import json
+
+class JSONLDataset(Dataset):
+    def __init__(self, jsonl_path, tokenizer, max_length=512):
+        self.data = []
+        self.tokenizer = tokenizer
+        self.max_length = max_length
+
+        # Load the data from the JSONL file
+        with open(jsonl_path, "r") as f:
+            for line in f:
+                item = json.loads(line)
+                document = item.get("document", "")
+                output = item.get("sentence_completion_task", {}).get("output", "")
+                self.data.append({"input": document, "output": output})
+
+        print(f"Loaded {len(self.data)} items.")
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, idx):
+        item = self.data[idx]
+
+        # Tokenize the input
+        inputs = self.tokenizer(
+            item["input"],
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors="pt"
+        )
+        # Tokenize the output (labels)
+        labels = self.tokenizer(
+            item["output"],
+            truncation=True,
+            max_length=self.max_length,
+            padding="max_length",
+            return_tensors="pt"
+        )
+
+        return {
+            "input_ids": inputs["input_ids"].squeeze(0),
+            "attention_mask": inputs["attention_mask"].squeeze(0),
+            "labels": labels["input_ids"].squeeze(0)
+        }
+
+def compute_negative_preference_loss(logits, labels, temperature=2.0):
+    """
+    Compute negative preference loss that pushes the model away from generating
+    the forgotten sequences while maintaining a valid probability distribution
+    """
+    # Create a distribution over the vocabulary
+    probs = F.softmax(logits / temperature, dim=-1)
+    
+    # Create a mask for valid positions (non-padding)
+    valid_mask = (labels != -100).float()
+    
+    # Convert labels to one-hot
+    labels_one_hot = F.one_hot(torch.clamp(labels, min=0), num_classes=logits.size(-1)).float()
+    
+    # Calculate negative preference: maximize entropy while minimizing probability of target tokens
+    entropy = -torch.sum(probs * torch.log(probs + 1e-10), dim=-1)
+    target_probs = torch.sum(probs * labels_one_hot, dim=-1)
+    
+    # Combine entropy maximization with target probability minimization
+    loss = -(entropy - target_probs * temperature)
+    
+    # Apply mask and average
+    loss = torch.sum(loss * valid_mask) / (torch.sum(valid_mask) + 1e-10)
+    
+    return loss
+
+def negative_preference_unlearning(
+    model, 
+    tokenizer, 
+    retain_loader, 
+    forget_loader, 
+    output_path, 
+    lr=1e-4, 
+    num_steps=50,
+    gradient_accumulation_steps=2,
+    temperature=2.0,
+    retain_weight=1.0,
+    forget_weight=1.0,
+    device="cuda" if torch.cuda.is_available() else "cpu"
+):
+    model.to(device)
+    model.train()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    scaler = torch.cuda.amp.GradScaler()
+
+    for step in range(num_steps):
+        total_forget_loss = 0.0
+        total_retain_loss = 0.0
+        
+        # Process forget set with negative preference
+        for i, batch in enumerate(forget_loader):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            with torch.cuda.amp.autocast():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+                logits = outputs.logits
+                
+                # Calculate negative preference loss
+                forget_loss = compute_negative_preference_loss(
+                    logits=logits,
+                    labels=labels,
+                    temperature=temperature
+                )
+                forget_loss = forget_loss * forget_weight
+
+            if forget_loss is not None:
+                scaler.scale(forget_loss).backward()
+            
+            if (i + 1) % gradient_accumulation_steps == 0 or (i + 1) == len(forget_loader):
+                if any(p.grad is not None for p in model.parameters()):
+                    scaler.step(optimizer)
+                    scaler.update()
+                optimizer.zero_grad()
+
+            total_forget_loss += forget_loss.item() if forget_loss is not None else 0
+
+        # Process retain set with standard training
+        for i, batch in enumerate(retain_loader):
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            labels = batch["labels"].to(device)
+
+            with torch.cuda.amp.autocast():
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask, labels=labels)
+                retain_loss = outputs.loss * retain_weight
+                retain_loss = retain_loss / gradient_accumulation_steps
+
+            scaler.scale(retain_loss).backward()
+
+            if (i + 1) % gradient_accumulation_steps == 0 or (i + 1) == len(retain_loader):
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
+
+            total_retain_loss += retain_loss.item()
+
+        # Print progress
+        avg_forget_loss = total_forget_loss / len(forget_loader)
+        avg_retain_loss = total_retain_loss / len(retain_loader)
+        print(f"Step {step + 1}/{num_steps} - "
+              f"Forget Loss: {avg_forget_loss:.4f}, "
+              f"Retain Loss: {avg_retain_loss:.4f}")
+
+        # Clear cache
+        torch.cuda.empty_cache()
+
+    # Save the updated model
+    model.save_pretrained(output_path)
+    tokenizer.save_pretrained(output_path)
+    print(f"Unlearned model saved to {output_path}")
+
+# Example Usage
+if __name__ == "__main__":
+    hf_token = "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"
+
+    # Load model and tokenizer
+    model = AutoModelForCausalLM.from_pretrained('semeval25-unlearning-1B-model')
+    tokenizer = AutoTokenizer.from_pretrained('allenai/OLMo-1B-0724-hf')
+
+    # Define paths
+    retain_path = "/teamspace/studios/this_studio/unlearning/semeval25-unlearning-data/mia_data/member.jsonl"
+    forget_path = "/teamspace/studios/this_studio/unlearning/semeval25-unlearning-data/mia_data/nonmember.jsonl"
+
+    # Initialize datasets and DataLoaders
+    retain_dataset = JSONLDataset(retain_path, tokenizer)
+    forget_dataset = JSONLDataset(forget_path, tokenizer)
+    retain_loader = DataLoader(retain_dataset, batch_size=1, shuffle=True)
+    forget_loader = DataLoader(forget_dataset, batch_size=1, shuffle=True)
+
+    # Output path
+    output_model_path = "./unlearning/output/unlearned_1b_model"
+
+    # Perform negative preference unlearning
+    negative_preference_unlearning(
+        model=model,
+        tokenizer=tokenizer,
+        retain_loader=retain_loader,
+        forget_loader=forget_loader,
+        output_path=output_model_path,
+        lr=1e-4,
+        num_steps=50,
+        gradient_accumulation_steps=2,
+        temperature=2.0,
+        retain_weight=1.0,
+        forget_weight=1.0
+    )
